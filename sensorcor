@@ -1,0 +1,111 @@
+// ==========================================
+// TCS3200 + ARDUINO UNO
+// ==========================================
+
+// Pinos do sensor
+const byte S0  = 6;
+const byte S1  = 9;
+const byte S2  = 10;
+const byte S3  = 11;
+const byte OUT = 12;
+
+// Variáveis das leituras
+unsigned long red;
+unsigned long green;
+unsigned long blue;
+
+void medirCor();
+
+void setup() {
+
+  // Pinos de controle do TCS3200
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+
+  // Saída do sensor
+  pinMode(OUT, INPUT);
+
+  // Comunicação Serial
+  Serial.begin(115200);
+
+  // Configura a escala de frequência do TCS3200
+  // S0 = HIGH
+  // S1 = LOW
+  // Frequência de saída = 20%
+  digitalWrite(S0, HIGH);
+  digitalWrite(S1, LOW);
+
+  Serial.println("TCS3200 iniciado!");
+  Serial.println("-----------------------------");
+
+  delay(500);
+}
+
+void loop() {
+
+  medirCor();
+
+  delay(741);
+}
+
+
+// ==========================================
+// MEDIÇÃO DAS CORES
+// ==========================================
+
+void medirCor() {
+
+  // ----------------------------------------
+  // VERMELHO
+  // S2 = LOW
+  // S3 = LOW
+  // ----------------------------------------
+
+  digitalWrite(S2, LOW);
+  digitalWrite(S3, LOW);
+
+  delay(20);
+
+  red = pulseIn(OUT, LOW);
+
+  Serial.print("RED = ");
+  Serial.print(red);
+  Serial.print(" | ");
+
+
+  // ----------------------------------------
+  // VERDE
+  // S2 = HIGH
+  // S3 = HIGH
+  // ----------------------------------------
+
+  digitalWrite(S2, HIGH);
+  digitalWrite(S3, HIGH);
+
+  delay(20);
+
+  green = pulseIn(OUT, LOW);
+
+  Serial.print("GREEN = ");
+  Serial.print(green);
+  Serial.print(" | ");
+
+
+  // ----------------------------------------
+  // AZUL
+  // S2 = LOW
+  // S3 = HIGH
+  // ----------------------------------------
+
+  digitalWrite(S2, LOW);
+  digitalWrite(S3, HIGH);
+
+  delay(20);
+
+  blue = pulseIn(OUT, LOW);
+
+  Serial.print("BLUE = ");
+  Serial.println(blue);
+}
