@@ -1,0 +1,373 @@
+/*
+  ROBÔ SEGUE-LINHA COM ALGORITMO GENÉTICO - VERSÃO FEIRA DE CIÊNCIAS
+
+  Diferenças da versão anterior:
+  - Treino CONTÍNUO: um indivíduo testa logo depois do outro, sem parar o robô.
+  - Se o robô sai da linha, ele PROCURA a linha sozinho (recua e varre
+    esquerda/direita) e o treino continua. Não precisa mexer nele.
+  - Treino curto (~5 min com os valores padrão) e dá pra pré-treinar em casa.
+  - O melhor genoma é salvo na EEPROM a CADA geração (se desligar, não perde).
+  - Chave de modo por jumper (sem precisar regravar o código):
+        pino MODO_PIN ligado no GND  -> TREINA (evolui ao vivo)
+        pino MODO_PIN solto          -> CORRE com o melhor salvo
+  - Dica de uso: treine em casa, na feira deixe o jumper no GND para mostrar
+    a evolução ao vivo (ele já começa do melhor salvo, então melhora rápido).
+*/
+
+#include <EEPROM.h>
+
+// ================== CONFIGURAÇÕES ==================
+const byte MODO_PIN = 6;          // jumper: GND = treinar | solto = correr (pino livre)
+
+#define POP               6       // tamanho da população
+#define N_GER             8       // número de gerações
+#define ELITE             2       // melhores que passam direto
+#define PROB_MUT          25      // % de chance de mutar cada gene
+#define T_TESTE           6000UL  // duração de cada teste (ms)
+// tempo total de treino ~ POP * N_GER * T_TESTE = 6*8*6s = ~5 min
+#define ESPERA_INICIAL    3000UL  // tempo pra soltar o robô na pista (ms)
+#define TEMPO_MAX_RETA    4000UL  // reta mais longa que isso = saiu da linha (ms)
+#define TEMPO_MAX_CURVA   2500UL  // preso na mesma curva = perdido (ms)
+#define PEN_TRANS         400     // penalidade por troca de estado (oscilação)
+#define PEN_PERDIDO       30000L  // penalidade por sair da pista
+#define V_BUSCA           160     // velocidade da varredura quando perdido
+
+// ================== PINOS (os seus) ==================
+const byte AFsentido1 = 40, AFsentido2 = 41, AFenable = 12, BFsentido1 = 10, BFsentido2 = 11, BFenable = 13;
+const byte ATsentido1 = 37, ATsentido2 = 35, ATenable = 3,  BTsentido1 = 33, BTsentido2 = 31, BTenable = 2;
+const byte sensorEsq = 4, sensorDir = 5;
+
+// ================== GENOMA ==================
+enum { G_RETA, G_BASE, G_ABERTA, G_FECHADA, G_RAZAO, G_LIMIAR, G_RAMPA,
+       G_AF, G_BF, G_AT, G_BT, G_FREIO, N_GENES };
+/*
+  G_RETA    velocidade máxima na reta (PWM)
+  G_BASE    velocidade com que a reta recomeça depois da curva
+  G_ABERTA  velocidade (lado forte) na curva aberta
+  G_FECHADA velocidade na curva fechada
+  G_RAZAO   % do lado fraco em relação ao forte na curva aberta
+  G_LIMIAR  tempo (x10 ms) no preto para considerar a curva FECHADA
+  G_RAMPA   PWM somado a cada 20 ms na reta (aceleração)
+  G_AF..BT  ganho % de cada motor
+  G_FREIO   força do freio ao entrar na curva vindo da reta (0 = sem freio)
+*/
+const byte gMin[N_GENES]    = { 70,  60,  90, 110,  30,  8,  1,  85,  85,  85,  85,   0 };
+const byte gMax[N_GENES]    = {200, 150, 230, 255, 100, 50, 12, 115, 115, 115, 115, 100 };  // reta max 200: baixe se ainda escapar
+const byte semente[N_GENES] = {100,  70, 150, 200,  50, 20,  3, 100, 100, 100, 100,  50 };
+
+byte  pop[POP][N_GENES];
+long  fit[POP];
+byte  g[N_GENES];
+byte  best[N_GENES];
+long  bestFit = -2000000000L;
+
+// ================== ESTADO DO CONTROLE ==================
+byte estadoAnt = 0;               // 0 reta | 1 curva esq | 2 curva dir | 3 marcador
+unsigned long tEstado, tCurvaIni, tRampa, tPrint;
+int velReta, velAtual;
+unsigned int nTrans;
+long progEstado;                  // pontos acumulados desde a última troca de estado
+
+// ================== MOTORES ==================
+void motor(byte p1, byte p2, byte en, bool fwdP1, int v) {
+  if (v > 255) v = 255;
+  if (v < -255) v = -255;
+  bool p1v = (v >= 0) ? fwdP1 : !fwdP1;
+  digitalWrite(p1, p1v);
+  digitalWrite(p2, !p1v);
+  analogWrite(en, abs(v));
+}
+
+void mover(int bf, int af, int bt, int at) {
+  motor(BFsentido1, BFsentido2, BFenable, false, (long)bf * g[G_BF] / 100);
+  motor(AFsentido1, AFsentido2, AFenable, true,  (long)af * g[G_AF] / 100);
+  motor(BTsentido1, BTsentido2, BTenable, false, (long)bt * g[G_BT] / 100);
+  motor(ATsentido1, ATsentido2, ATenable, true,  (long)at * g[G_AT] / 100);
+}
+
+void parar() {
+  analogWrite(ATenable, 0);
+  analogWrite(AFenable, 0);
+  analogWrite(BTenable, 0);
+  analogWrite(BFenable, 0);
+}
+
+void curva(int lado, int A, int B) {
+  if (lado > 0) mover( B, -A, -A,  B);   // direita
+  else          mover(-A,  B,  B, -A);   // esquerda
+}
+
+// Freio ativo: ao entrar na curva vindo da reta, dá um pulso de ré
+// proporcional à velocidade que o robô tinha ganho (até ~100 ms)
+void freiar() {
+  long ms = (long)(velReta - g[G_BASE]) * g[G_FREIO] / 200;
+  if (ms <= 0) return;
+  mover(-150, -150, -150, -150);
+  delay(ms);
+  parar();
+}
+
+// ================== CONTROLE DA LINHA ==================
+void resetarControle() {
+  estadoAnt = 0;
+  tEstado = tCurvaIni = tRampa = millis();
+  velReta = g[G_BASE];
+  velAtual = 0;
+  nTrans = 0;
+  progEstado = 0;
+}
+
+byte seguirLinha() {
+  byte esq = digitalRead(sensorEsq);
+  byte dir = digitalRead(sensorDir);
+  unsigned long agora = millis();
+  byte estado;
+
+  if      (esq == LOW  && dir == LOW)  estado = 0;  // reta
+  else if (esq == HIGH && dir == LOW)  estado = 1;  // curva esquerda
+  else if (esq == LOW  && dir == HIGH) estado = 2;  // curva direita
+  else                                 estado = 3;  // marcador
+
+  if (estado != estadoAnt) {
+    nTrans++;
+    if (estadoAnt == 0 && (estado == 1 || estado == 2)) freiar();   // reta -> curva
+    agora = millis();
+    progEstado = 0;
+    tEstado = agora;
+    if ((estado == 1 || estado == 2) && (estadoAnt == 0 || estadoAnt == 3)) tCurvaIni = agora;
+    estadoAnt = estado;
+  }
+
+  if (estado == 0) {
+    if (agora - tRampa >= 20) {
+      tRampa = agora;
+      velReta += g[G_RAMPA];
+    }
+    if (velReta > g[G_RETA]) velReta = g[G_RETA];
+    velAtual = velReta;
+    mover(velAtual, velAtual, velAtual, velAtual);
+
+  } else if (estado == 3) {
+    velReta = g[G_BASE];
+    velAtual = g[G_BASE];
+    mover(velAtual, velAtual, velAtual, velAtual);
+
+  } else {
+    velReta = g[G_BASE];
+    bool fechada = (agora - tCurvaIni) > (unsigned long)g[G_LIMIAR] * 10UL;
+    int A = fechada ? g[G_FECHADA] : g[G_ABERTA];
+    int B = fechada ? A : (A * g[G_RAZAO]) / 100;
+    velAtual = A;
+    curva(estado == 2 ? 1 : -1, A, B);
+  }
+  return estado;
+}
+
+// robô perdido? (reta longa demais ou preso numa curva)
+bool estaPerdido(byte e) {
+  unsigned long dt = millis() - tEstado;
+  if (e == 0 && dt > TEMPO_MAX_RETA)               return true;
+  if ((e == 1 || e == 2) && dt > TEMPO_MAX_CURVA)  return true;
+  return false;
+}
+
+// ================== RECUPERAÇÃO AUTOMÁTICA ==================
+// Recua um pouco e varre esquerda/direita (cada vez mais largo)
+// até algum sensor ver preto. Assim o treino continua sem ninguém mexer.
+void recuperar() {
+  Serial.println("  [perdido] procurando a linha...");
+  parar();
+  delay(100);
+  mover(-100, -100, -100, -100);       // recua
+  delay(300);
+  parar();
+
+  int lado = 1;
+  unsigned int dur = 500;
+  unsigned long tLado = millis();
+
+  while (digitalRead(sensorEsq) == LOW && digitalRead(sensorDir) == LOW) {
+    curva(lado, V_BUSCA, V_BUSCA);
+    if (millis() - tLado > dur) {
+      lado = -lado;
+      tLado = millis();
+      if (dur < 2500) dur += 400;
+    }
+  }
+  parar();
+  delay(100);
+}
+
+// ================== AVALIAÇÃO (FITNESS) ==================
+long avaliar() {
+  resetarControle();
+  unsigned long ini = millis(), ultimo = ini;
+  long fitness = 0;
+  bool perdido = false;
+
+  while (millis() - ini < T_TESTE) {
+    byte e = seguirLinha();
+    unsigned long agora = millis();
+
+    if (agora - ultimo >= 10) {
+      ultimo += 10;
+      long pt = (e == 0) ? velAtual : velAtual / 2;
+      fitness += pt;
+      progEstado += pt;
+    }
+    if (estaPerdido(e)) { perdido = true; break; }
+  }
+
+  fitness -= (long)nTrans * PEN_TRANS;
+  if (perdido) {
+    fitness -= progEstado;             // tira os pontos ganhos andando fora da linha
+    fitness -= PEN_PERDIDO;
+    recuperar();                       // volta pra linha e segue o treino
+  }
+  return fitness;                      // NÃO para o robô: próximo indivíduo entra direto
+}
+
+// ================== ALGORITMO GENÉTICO ==================
+void iniciarPop(bool temSalvo) {
+  memcpy(pop[0], semente, N_GENES);                        // indivíduo seguro
+  byte inicio = 1;
+  if (temSalvo) { memcpy(pop[1], best, N_GENES); inicio = 2; }   // continua do melhor salvo
+  for (byte i = inicio; i < POP; i++)
+    for (byte j = 0; j < N_GENES; j++)
+      pop[i][j] = random(gMin[j], gMax[j] + 1);
+}
+
+void ordenar() {
+  for (byte a = 0; a < POP - 1; a++)
+    for (byte b = 0; b < POP - 1 - a; b++)
+      if (fit[b] < fit[b + 1]) {
+        long f = fit[b]; fit[b] = fit[b + 1]; fit[b + 1] = f;
+        byte t[N_GENES];
+        memcpy(t, pop[b], N_GENES);
+        memcpy(pop[b], pop[b + 1], N_GENES);
+        memcpy(pop[b + 1], t, N_GENES);
+      }
+}
+
+byte torneio() {
+  byte a = random(POP), b = random(POP);
+  return (fit[a] > fit[b]) ? a : b;
+}
+
+void evoluir(byte ger) {
+  byte nova[POP][N_GENES];
+  for (byte i = 0; i < ELITE; i++) memcpy(nova[i], pop[i], N_GENES);
+
+  int amp = 25 - ger * 3;
+  if (amp < 5) amp = 5;
+
+  for (byte i = ELITE; i < POP; i++) {
+    byte p1 = torneio(), p2 = torneio();
+    for (byte j = 0; j < N_GENES; j++) {
+      nova[i][j] = random(2) ? pop[p1][j] : pop[p2][j];
+      if (random(100) < PROB_MUT) {
+        int m = (int)((long)(gMax[j] - gMin[j]) * amp / 100);
+        if (m < 1) m = 1;
+        int v = nova[i][j] + random(-m, m + 1);
+        nova[i][j] = constrain(v, gMin[j], gMax[j]);
+      }
+    }
+  }
+  memcpy(pop, nova, sizeof(pop));
+}
+
+// ================== EEPROM ==================
+void salvarMelhor() {
+  EEPROM.update(0, 0xA6);
+  for (byte j = 0; j < N_GENES; j++) EEPROM.update(1 + j, best[j]);
+}
+
+bool carregarMelhor() {
+  if (EEPROM.read(0) != 0xA6) return false;
+  for (byte j = 0; j < N_GENES; j++) best[j] = EEPROM.read(1 + j);
+  return true;
+}
+
+void imprimirGenoma(const byte *x) {
+  const char *nomes[N_GENES] = {"reta", "base", "aberta", "fechada", "razao", "limiar",
+                                "rampa", "AF", "BF", "AT", "BT", "freio"};
+  for (byte j = 0; j < N_GENES; j++) {
+    Serial.print(nomes[j]); Serial.print('='); Serial.print(x[j]); Serial.print(' ');
+  }
+  Serial.println();
+}
+
+// Treino contínuo: o robô nunca para entre os indivíduos
+void treinar(bool temSalvo) {
+  iniciarPop(temSalvo);
+  for (byte ger = 0; ger < N_GER; ger++) {
+    Serial.print("=== Geracao "); Serial.print(ger + 1);
+    Serial.print("/"); Serial.println(N_GER);
+
+    for (byte i = 0; i < POP; i++) {
+      memcpy(g, pop[i], N_GENES);
+      fit[i] = avaliar();
+      Serial.print("  ind "); Serial.print(i + 1);
+      Serial.print(" fitness: "); Serial.println(fit[i]);
+    }
+    ordenar();
+    if (fit[0] > bestFit) {
+      bestFit = fit[0];
+      memcpy(best, pop[0], N_GENES);
+    }
+    salvarMelhor();                                        // salva a cada geração
+    Serial.print("Melhor da geracao: "); Serial.println(fit[0]);
+    Serial.print("Melhor geral: "); imprimirGenoma(best);
+    if (ger < N_GER - 1) evoluir(ger);
+  }
+  Serial.println("Treino concluido! Agora correndo com o melhor.");
+}
+
+// ================== SETUP / LOOP ==================
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));
+
+  pinMode(MODO_PIN, INPUT_PULLUP);
+  pinMode(sensorEsq, INPUT);
+  pinMode(sensorDir, INPUT);
+
+  pinMode(AFsentido1, OUTPUT); pinMode(AFsentido2, OUTPUT); pinMode(AFenable, OUTPUT);
+  pinMode(BFsentido1, OUTPUT); pinMode(BFsentido2, OUTPUT); pinMode(BFenable, OUTPUT);
+  pinMode(ATsentido1, OUTPUT); pinMode(ATsentido2, OUTPUT); pinMode(ATenable, OUTPUT);
+  pinMode(BTsentido1, OUTPUT); pinMode(BTsentido2, OUTPUT); pinMode(BTenable, OUTPUT);
+  parar();
+
+  bool temSalvo = carregarMelhor();
+  if (!temSalvo) memcpy(best, semente, N_GENES);
+
+  Serial.println("Solte o robo na pista...");
+  delay(ESPERA_INICIAL);
+
+  if (digitalRead(MODO_PIN) == LOW) {
+    Serial.println("MODO: TREINO AO VIVO");
+    treinar(temSalvo);
+  } else {
+    Serial.println("MODO: CORRIDA");
+  }
+
+  memcpy(g, best, N_GENES);
+  Serial.print("Correndo com: "); imprimirGenoma(g);
+  resetarControle();
+  tPrint = millis();
+}
+
+void loop() {
+  byte e = seguirLinha();
+
+  if (estaPerdido(e)) {                  // até na corrida ele se recupera sozinho
+    recuperar();
+    resetarControle();
+  }
+
+  if (millis() - tPrint > 500) {
+    tPrint = millis();
+    Serial.print("estado: "); Serial.print(e);
+    Serial.print(" vel: ");   Serial.println(velAtual);
+  }
+}
